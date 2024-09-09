@@ -1,0 +1,370 @@
+%variables
+FSIZE=1024
+-old:LINENCAP=1
+NOENCAP={1:No encapsulation,0:Encapsulation}
+NOFWFEC={1:No FW FEC,0:FW FEC}
+NOBWFEC={1:No BW FEC,0:BW FEC}
+DOREPAIR={1:Active FEC,0:No repair packet}
+GEN_RATE=-1
+DOPRINT=0
+FASTFEC={0:Normal,1:LIBMOEPGF}
+DODROP={1:Drop packet(static for now),0:No drop}
+rate:GEN_RATE=[500-4000#500]
+CPU=4
+RSSPP=0
+BIN=click
+GEN_BIN=click
+LINK_BIN=click
+ALPHAFEC=0.80
+BETAFEC=0.50
+WINDOWSIZE=20
+ISUNIFORMDROP=0
+ISDETERMINISTIC=0
+UDROPRATE=0.03
+KEEPALIVE=0
+STATS=0
+-old:LINKTHREADS=4
+DELAY=10
+FECDELAY=0
+WINDOWSTEP=-1
+MINIMALSYSTEMDEC=0
+MAXLOAD=80
+SCALE=share
+parallel:SCALE=parallel
+PREFETCH=false
+CLONE=true
+noclone:CLONE=false
+FAST=true
+nomoe:FAST=false
+{
+    exp:KDROP=[0.99-1.0#]
+    exp:PDROP=[0.0-0.03#]
+    exp:HDROP=[0.15-1.0#]
+    exp:RDROP=[0.2-0.8#]
+}
+TCPCC=cubic
+udpgen:GEN_LENGTH=1024
+//Needs the prate tag!
+udpgen:GEN_RATE=1000000
+udpgen:GEN_IPV6=1
+udpgen:GEN_PIPELINE=0
+udpgen:GEN_SEQUENTIAL=1
+udpgen,single:MODE=singleduplex
+
+%config
+graph_tick_params={direction:in,which:both,axis:both,grid_linestyle:dotted,bottom:true,top:true,right:true,left:true,grid_color:#444444}
+var_grid=true
+graph_fillstyle=none
+graph_legend_params={fancybox:0,edgecolor:white,facecolor:white,framealpha:0}
+var_unit={THROUGHPUT:Gbps}
+var_format={THROUGHPUT:%.01f}
+-udpgen:var_divider={THROUGHPUT:125000000}
+udpgen:var_divider={THROUGHPUT:1000000000}
+var_divider+={result-REFGOODPC:0.01}
+var_format={REFGOODPC:%d}
+graph_result_as_variable={PERFENC-(.*):PerfEnc,PERFDEC-(.*):PerfDec}
+var_names={GEN_RATE:Target requests per second,REFGOODPC:% packets received}
+udpgen:var_names+={GEN_RATE:Packets per second}
+accept_zero={.*DROP.*,RECOVERED,TOTALSYSTEMTRIED,TOTALSYSTEMTRIED,DECODERBW_SKIPPED,DECODERBW_OVERLOAD,DECODERBW_REPAIRBS,OVERHEAD_PACKET,CTR2}
+udpgen,single:accept_zero+={THROUGHPUT,COUNT,LATENCY,BYTES,PPS}
+var_names+={THROUGHPUT:Throughput,DELAY:Link delay (ms)}
+udpgen,single:results_expect={REFCOUNT}
+//var_aggregate={KDROP+PDROP+HDROP+RDROP:all}
+
+%require
+test $NOFWFEC = 1 -o \( $NOFWFEC = 0 -a $NOENCAP = 0 \)
+test $NOBWFEC = 1 -o \( $NOBWFEC = 0 -a $NOENCAP = 0 \)
+//test $DOREPAIR = 0 -o \( $DOREPAIR = 1 -a $NOFEC = 0 \)
+
+%sendfile perf.map
+
+%late_variables
+PERF_CLASS_MAP=EXPAND($NPF_ROOT_PATH/libs/perf/kernel.map $NPF_ROOT/perf.map)
+FEC_PATH?=/users/TomB/workspace/Fast-SRv6-FEC/
+LINK_PATH=/users/TomB/workspace/Fast-SRv6-FEC-2/
+WRK_HOST=server
+HTTP_PORT=8188
+FILE_PATH=/bin
+NGINX_USER=root
+MTU=1280
+gdb:GDB=gdb -ex run -ex "signal 2" -ex bt -batch -args
+-parallel:MAXCPUDEC?=EXPAND($(( int($CPU / 2) )) )
+-parallel:MAXCPUENC?=EXPAND($(( $CPU - $MAXCPUDEC )) )
+parallel:MAXCPUDEC=EXPAND($(( $CPU )) )
+parallel:MAXCPUENC=EXPAND($(( $CPU )) )
+
+%-tunnel,-udpgen:import@client wrk2 delay=6
+
+%udpgen,-single:import@client fastclick-play-single-mt GEN_DUMP=-1 delay=5
+%udpgen,single:import@server fastclick-play-single-mt GEN_DUMP=-1 delay=5
+
+
+%init@client sudo=true 0:ip6=babe:1::5
+function addline() {
+    line=$1
+    file=$2
+    sudo grep "$line" $file &> /dev/null
+    if [ $? != 0 ] ; then
+        sudo su -c "echo \"$line\" >> $file"
+    fi
+}
+sysctl net.ipv4.tcp_congestion_control=$TCPCC
+addline "babe:2::5 server" /etc/hosts
+ifconfig ${self:0:ifname} hw ether 00:00:00:00:00:01
+ifconfig ${self:0:ifname} add babe:1::5/64
+ifconfig ${self:0:ifname} mtu $MTU
+ip -6 route add default dev ${self:0:ifname} via babe:1::6
+sysctl net.ipv6.conf.all.seg6_enabled=$LINENCAP
+sysctl net.ipv6.conf.default.seg6_enabled=$LINENCAP
+sysctl net.ipv6.conf.${self:0:ifname}.seg6_enabled=$LINENCAP
+//tc qdisc add dev ${self:0:ifname} root netem delay 50ms
+// tc qdisc del dev ${self:0:ifname} root netem
+
+%-dpdk:script@router1 sudo=true title=router1-nodpdk
+LD_LIBRARY_PATH=/usr/local/lib:/users/TomB/workspace/dpdk/install/lib/x86_64-linux-gnu/
+export LD_LIBRARY_PATH
+ifconfig ${self:0:ifname} mtu 1674
+ifconfig ${self:1:ifname} mtu 1674
+ifconfig ${self:0:ifname} add babe:1::6/64
+ifconfig ${self:0:ifname} add fc00::a/64
+ifconfig ${self:1:ifname} add babe:3::1/64
+$GDB $FEC_PATH/bin/$BIN -j $CPU ROUTER1 intif=${self:1:ifname} extif=${self:0:ifname} nofwfec=$NOFWFEC nobwfec=$NOBWFEC doprint=$DOPRINT noencap=$NOENCAP nofakefec=$DOREPAIR windowsize=$WINDOWSIZE maxcpudec=$MAXCPUDEC maxcpuenc=$MAXCPUENC rsspp=$RSSPP isuniformdrop=$ISUNIFORMDROP udroprate=$UDROPRATE windowstep=$WINDOWSTEP minimalsystemdec=$MINIMALSYSTEMDEC scale=$SCALE clone=$CLONE fast=$FAST prefetch=$PREFETCH maxload=$MAXLOAD
+
+%dpdk:script@router1 sudo=true title=router1-dpdk  critical=true
+LD_LIBRARY_PATH=/usr/local/lib:/users/TomB/workspace/dpdk/install/lib/x86_64-linux-gnu/
+export LD_LIBRARY_PATH
+if [[ "${self:0:ifname}" == *"vlan"* ]] ; then
+	VLAN="--vdev=eth_af_packet0,iface=vlan386,blocksz=4096,framesz=2048,framecnt=512,qpairs=$CPU,qdisc_bypass=0 --vdev=eth_af_packet1,iface=vlan327,blocksz=4096,framesz=2048,framecnt=512,qpairs=$CPU,qdisc_bypass=0 --no-pci"
+fi
+$GDB $FEC_PATH/bin/$BIN --dpdk -l 0-$(($CPU - 0)) $VLAN -- $FEC_PATH/mininet/switch/configs/forward_sw1_dpdk.click intif=${router1:1:pci} extif=${router1:0:pci} nofwfec=$NOFWFEC nobwfec=$NOBWFEC doprint=$DOPRINT noencap=$NOENCAP nofakefec=$DOREPAIR fastfec=$FASTFEC windowsize=$WINDOWSIZE alpha=$ALPHAFEC beta=$BETAFEC maxcpudec=$MAXCPUDEC maxcpuenc=$MAXCPUENC rsspp=$RSSPP isuniformdrop=$ISUNIFORMDROP udroprate=$UDROPRATE stats=$STATS rules=./rules-1 windowstep=$WINDOWSTEP minimalsystemdec=$MINIMALSYSTEMDEC scale=$SCALE clone=$CLONE fast=$FAST prefetch=$PREFETCH maxload=$MAXLOAD
+
+%init@router1 sudo=true title=router1-init
+killall click
+LD_LIBRARY_PATH=/usr/local/lib:/users/TomB/workspace/dpdk/install/lib/x86_64-linux-gnu/
+export LD_LIBRARY_PATH
+
+%perf:import@router1 perf-class delay=8 PERF_PREFIX=ENC
+
+%perf:import@router2 perf-class delay=8 PERF_PREFIX=DEC
+
+%-dpdk:script@router2 sudo=true
+LD_LIBRARY_PATH=/usr/local/lib:/users/TomB/workspace/dpdk/install/lib/x86_64-linux-gnu/
+export LD_LIBRARY_PATH
+ifconfig ${self:0:pci} mtu 1674
+ifconfig ${self:1:pci} mtu 1674
+ifconfig ${self:1:pci} add babe:2::8/64
+ifconfig ${self:0:pci} add fc00::9/64
+ifconfig ${self:0:pci} add babe:3::2/64
+$GDB $FEC_PATH/bin/$BIN -j $CPU ROUTER2 intif=${self:1:ifname} extif=${self:0:ifname} nofwfec=$NOFWFEC nobwfec=$NOBWFEC doprint=$DOPRINT noencap=$NOENCAP nofakefec=$DOREPAIR windowsize=$WINDOWSIZE maxcpudec=$MAXCPUDEC maxcpuenc=$MAXCPUENC rsspp=$RSSPP isuniformdrop=$ISUNIFORMDROP udroprate=$UDROPRATE fecdelay=$FECDELAY windowstep=$WINDOWSTEP minimalsystemdec=$MINIMALSYSTEMDEC  scale=$SCALE clone=$CLONE fast=$FAST prefetch=$PREFETCH maxload=$MAXLOAD
+
+%file@router1 rules-1
+$(( "\n".join([ "flow create 0 ingress pattern eth dst is 00:00:00:00:%x:12 / end actions queue index %d / end" % (i+32,i) for i in range($MAXCPUDEC) ]) ))
+
+%file@router2 rules-2
+$(( "\n".join([ "flow create 0 ingress pattern eth dst is 00:00:00:00:%x:13 / end actions queue index %d / end" % (i+32,i) for i in range($MAXCPUDEC) ]) ))
+
+%dpdk:script@router2 sudo=true
+LD_LIBRARY_PATH=/usr/local/lib:/users/TomB/workspace/dpdk/install/lib/x86_64-linux-gnu/
+export LD_LIBRARY_PATH
+if [[ "${self:0:ifname}" == *"vlan"* ]] ; then
+	VLAN="--vdev=eth_af_packet0,iface=vlan388,blocksz=4096,framesz=2048,framecnt=512,qpairs=$CPU,qdisc_bypass=0 --vdev=eth_af_packet1,iface=vlan382,blocksz=4096,framesz=2048,framecnt=512,qpairs=$CPU,qdisc_bypass=0 --no-pci"
+fi
+$GDB $FEC_PATH/bin/$BIN --dpdk -l 0-$(($CPU - 0)) $VLAN -- $FEC_PATH/mininet/switch/configs/forward_sw2_dpdk.click intif=${router2:1:pci} extif=${router2:0:pci} nofwfec=$NOFWFEC nobwfec=$NOBWFEC doprint=$DOPRINT noencap=$NOENCAP nofakefec=$DOREPAIR fastfec=$FASTFEC windowsize=$WINDOWSIZE alpha=$ALPHAFEC beta=$BETAFEC maxcpudec=$MAXCPUDEC maxcpuenc=$MAXCPUENC rsspp=$RSSPP isuniformdrop=$ISUNIFORMDROP udroprate=$UDROPRATE stats=$STATS rules=./rules-2 fecdelay=$FECDELAY windowstep=$WINDOWSTEP minimalsystemdec=$MINIMALSYSTEMDEC  scale=$SCALE clone=$CLONE fast=$FAST prefetch=$PREFETCH maxload=$MAXLOAD
+
+%pypost
+#for RUN, RESULTS in ALL_RESULTS.items():
+#	if 'REFPPS' in RESULTS:
+#		ALL_RESULTS[RUN]['REFGOODPC'] = common_divide(RESULTS['REFPPS'],RESULTS['TXPPS'])
+results_divide('REFGOODPPS', 'REFPPS', 'TXPPS')
+results_divide('REFGOODPC', 'REFCOUNT', 'SENT')
+
+%init@router2 sudo=true
+killall click
+LD_LIBRARY_PATH=/usr/local/lib
+export LD_LIBRARY_PATH
+
+%-tunnel,-udpgen:import@server nginx delay=1
+%init@server sudo=true 0:ip6=babe:2::5
+apt-get -y install nginx && service nginx stop
+ifconfig ${self:0:ifname} hw ether 00:00:00:00:00:04
+ifconfig ${self:0:ifname} add babe:2::5/64
+ifconfig ${self:0:ifname} mtu $MTU
+sysctl net.ipv6.conf.all.seg6_enabled=$LINENCAP
+sysctl net.ipv6.conf.default.seg6_enabled=$LINENCAP
+sysctl net.ipv6.conf.${self:0:ifname}.seg6_enabled=$LINENCAP
+sysctl net.ipv4.tcp_congestion_control=$TCPCC
+ip -6 route del default
+ip -6 route add default dev ${self:0:ifname} via babe:2::8
+// tc qdisc add dev ${self:0:ifname} root netem delay 50ms
+// tc qdisc del dev ${self:0:ifname} root netem
+
+
+%script@server autokill=false
+mkdir -p nginx
+dd if=/dev/urandom of=./nginx/bin bs=1K count=$FSIZE
+// retran_before=$(netstat -s | grep "segments retransmitted" | tr -s ' ' | cut -d ' ' -f 2)
+
+// %script@server waitfor=WRK_FINISHED
+// retran_after=$(netstat -s | grep "segments retransmitted" | tr -s ' ' | cut -d ' ' -f 2)
+// echo "RESULT-RETRANSMISSION $(($retran_after - $retran_before))" 
+
+%pyexit
+import numpy as np
+RESULTS["FWFECRATIO"]=RESULTS["ENCODERFW_TXCOUNT"] / RESULTS["ENCODERFW_COUNT"]
+RESULTS["FWLOSSRATIO"]=RESULTS["DECODERFW_COUNT"] / RESULTS["ENCODERFW_TXCOUNT"]
+RESULTS["BWFECRATIO"]=RESULTS["ENCODERBW_TXCOUNT"] / RESULTS["ENCODERBW_COUNT"]
+RESULTS["BWLOSSRATIO"]=RESULTS["DECODERBW_COUNT"] / RESULTS["ENCODERBW_TXCOUNT"]
+RESULTS["RATIORECOVERED"]=RESULTS["RECOVERED"] / RESULTS["LINK_DROP_SOURCE"]
+RESULTS["OVERHEAD_PACKETS_BEFORE"]=RESULTS["OVERHEAD_DECODER"] / RESULTS["NB-PACKETS-INGRESS"]
+RESULTS["OVERHEAD_PACKETS"]=RESULTS["OVERHEAD_DECODER"] / RESULTS["OVERHEAD_PACKET"]
+
+%udpgen,-single:script@server sudo=true
+LD_LIBRARY_PATH=/usr/local/lib:/users/TomB/workspace/dpdk/install/lib/x86_64-linux-gnu/
+export LD_LIBRARY_PATH
+$GDB $LINK_PATH/bin/$GEN_BIN --dpdk -l 0-15 $VLAN  -- SERVER
+
+%udpgen,-single:file@server SERVER
+
+fd1 :: FromDPDKDevice(${server:0:pci}, VERBOSE 10, SCALE SHARE, PROMISC 1, NDESC 4096)
+//-> Print(REF,-1)
+	-> MarkIP6Header(OFFSET 14)
+	-> IP6Mirror
+	-> ac :: AverageCounterIMP(IGNORE 1)
+	-> EtherMirror
+	-> ToDPDKDevice(${server:0:pci}, BLOCKING true);
+
+DriverManager(
+	print "Launching loopback server",
+	 wait,
+	read fd1.xstats,
+	 print "RESULT-REFDROPPED $(fd1.hw_dropped)",
+	 print "RESULT-REFTHROUGHPUT $(ac.link_rate)",
+	 print "RESULT-REFCOUNT $(ac.count)",
+	 print "RESULT-REFPPS $(ac.rate)");
+
+%udpgen,single:script@client sudo=true
+LD_LIBRARY_PATH=/usr/local/lib:/users/TomB/workspace/dpdk/install/lib/x86_64-linux-gnu/
+export LD_LIBRARY_PATH
+$GDB $LINK_PATH/bin/$GEN_BIN --dpdk -l 0-15 $VLAN  -- SERVER
+
+%udpgen,single:file@server SERVER
+
+fd1 :: FromDPDKDevice(${server:0:pci}, VERBOSE 10, SCALE SHARE, PROMISC 1, NDESC 4096)
+	-> ac :: AverageCounterIMP(IGNORE 1, THRESHOLD 1000)
+	-> Discard;
+
+/*Script(TYPE ACTIVE,
+	set t $(now),
+	print "REF-$t-RESULT-REFTHROUGHPUT $(ac.link_rate)",
+	print "REF-$t-RESULT-REFPPS $(ac.rate)",
+	write ac.reset,
+	wait 1s,
+	loop);*/
+
+DriverManager(wait, print "RESULT-REFDROPPED $(fd1.hw_dropped)", 
+	print "RESULT-REFTHROUGHPUT $(ac.link_rate)",
+	print "RESULT-REFPPS $(ac.rate)",
+	print "RESULT-REFCOUNT $(fd1.hw_count)",
+	read fd1.xstats,
+);
+
+%link:script@link sudo=true
+LD_LIBRARY_PATH=/usr/local/lib:/users/TomB/workspace/dpdk/install/lib/x86_64-linux-gnu/
+export LD_LIBRARY_PATH
+if [[ "${self:0:ifname}" == *"vlan"* ]] ; then
+	VLAN="--vdev=eth_af_packet0,iface=vlan386,blocksz=4096,framesz=2048,framecnt=512,qpairs=1,qdisc_bypass=0 --vdev=eth_af_packet1,iface=vlan388,blocksz=4096,framesz=2048,framecnt=512,qpairs=1,qdisc_bypass=0 --no-pci"
+fi
+
+$GDB $LINK_PATH/bin/$LINK_BIN --dpdk -l 0-15 $VLAN  -- LINK 
+
+%file@link LINK
+
+elementclass LPIPE {$th |
+    [0]
+//   $(( "   -> lu :: LinkQueue(LATENCY ${DELAY}ms, BANDWIDTH 0)" if ${DELAY} > 0 else "" ))
+   $(( "-> Queue -> lu :: LinkUnqueue(LATENCY ${DELAY}ms, BANDWIDTH 0)" if ${DELAY} > 0 else "" ))
+    -> [0];
+
+	StaticThreadSched(lu $th);
+};
+
+fd1 :: FromDPDKDevice(${link:0:pci}, VERBOSE 10, SCALE SHARE, PROMISC 1, MAXTHREADS $LINKTHREADS, NDESC 4096, PAUSE none)
+    -> c1 :: Classifier(12/0027, -)[1]
+    -> Print(LEFT, ACTIVE $DOPRINT)
+    -> ac1 :: AverageCounterIMP(THRESHOLD 1000, IGNORE 1)
+    -> e1 :: ExactCPUSwitch;
+td1 :: ToDPDKDevice(${link:1:pci}, VERBOSE 99);
+
+    e1[0] -> LPIPE(0) -> td1;
+    e1[1] -> LPIPE(1) -> td1;
+    e1[2] -> LPIPE(2) -> td1;
+    e1[3] -> LPIPE(3) -> td1;
+
+	c1[0] -> Discard;
+fd2 :: FromDPDKDevice(${link:1:pci}, VERBOSE 10, SCALE SHARE, PROMISC 1, MAXTHREADS $LINKTHREADS, NDESC 4096, PAUSE none)
+    -> c2 :: Classifier(12/0027, -)[1]
+    -> Print(RIGHT, ACTIVE $DOPRINT)
+    -> ac2 :: AverageCounterIMP(THRESHOLD 1000, IGNORE 1)
+    -> sdrop :: {
+        [0] -> s :: Switch($DODROP);
+            s[0] -> [0];
+            s[1] -> Print(DROPPACKET, -1, ACTIVE false) 
+	-> drop :: IP6Drop(ADDR fc00::9, ADDR babe:1::5, UNIFORM $ISUNIFORMDROP, UDROPRATE $UDROPRATE, DETERMINISTIC $ISDETERMINISTIC, K $KDROP, P $PDROP, R $RDROP, H $HDROP) 
+	-> [0];
+    }
+    -> e2 :: ExactCPUSwitch;
+    
+    td2 :: ToDPDKDevice(${link:0:pci}, VERBOSE 99);
+    e2[0] -> LPIPE(4) -> td2;
+    e2[1] -> LPIPE(5) -> td2;
+    e2[2] -> LPIPE(6) -> td2;
+    e2[3] -> LPIPE(7) -> td2;
+c2-> Discard;
+DriverManager(	wait, 
+		print "RESULT-LINKHWDROPPED $(add $(fd1.hw_dropped) $(fd2.hw_dropped))",
+		print "RESULT-LINKSWDROPPED $(add $(q1.drops) $(q2.drops))",
+		print "RESULT-LINKBWDROPPED $(sub $(fd2.xstats rx_good_packets) $(fd1.xstats tx_good_packets))",
+		print "RESULT-LINKFWLINKRATE $(ac1.link_rate)",
+		print "RESULT-LINKBWLINKRATE $(ac2.link_rate)",
+		print "RESULT-LINK_DROP_SOURCE $(sdrop/drop.drop_source)",
+		print "RESULT-CTR2 $(td2.count)"		,
+		read fd1.xstats,
+		read fd2.xstats
+)
+
+
+Script(TYPE ACTIVE,
+        set time $(now),
+	read load,
+        print "LINK-$time-RESULT-LOAD $(add $(load))",
+        print "LINK-$time-RESULT-MAXLOAD $(max $(load))",
+        wait 1s,
+        loop
+)
+
+%-dpdk:include socket.npf
+
+%rdma:script@server sudo=true delay=4 autokill=false
+cd ~/workspace/perftest-v6
+./ib_${RDMAOP}_bw --ipv6 --ipv6-addr --gid-index 5 -q $QP
+sleep 1
+./ib_${RDMAOP}_lat --ipv6 --ipv6-addr --gid-index 5
+
+%rdma:script@client sudo=true delay=6
+cd  ~/workspace/perftest-v6
+./ib_${RDMAOP}_bw --ipv6 --ipv6-addr -d mlx5_0 -s $FSIZE --rate_limit=10 -D $GEN_TIME -q $QP -F --gid-index 5 babe:2::5 | tee rdmaout
+l=$(cat rdmaout | tail -n 2 | head -n 1 | tr -s ' ')
+bw=$(echo $l | cut -d' ' -f4)
+msg=$(echo $l | cut -d' ' -f5)
+echo "RESULT-RDMA-BW $bw"
+echo "RESULT-RDMA-MSG $msg"
+sleep 3
+timeout $(( $GEN_TIME + 5 )) ./ib_${RDMAOP}_lat --ipv6 --ipv6-addr -d mlx5_0 -s $FSIZE --rate_limit=10 -D $GEN_TIME -F --gid-index 5 babe:2::5 | tee rdmaout
+l=$(cat rdmaout | tail -n 2 | head -n 1 | tr -s ' ')
+avg=$(echo $l | cut -d' ' -f3)
+tps=$(echo $l | cut -d' ' -f4)
+echo "RESULT-RDMA-AVG $avg"
+echo "RESULT-RDMA-TPS $tps"
+
+
+echo "End of client"
